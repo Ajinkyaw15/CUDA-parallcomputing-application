@@ -1,99 +1,48 @@
-# Distributed Lock System (ZooKeeper + Java)
+# CUDA Matrix Multiplication: Global vs Shared Memory
 
-## 📌 Overview
-This project demonstrates **Distributed Mutual Exclusion** using:
-1. Apache ZooKeeper (Industry-level implementation)
-2. Java File-based Lock (Custom implementation)
+Compares two CUDA kernels computing `C = A x B` for square `N x N` float matrices:
 
-The goal is to show how **only one process can access a shared resource at a time**.
+| Kernel | Idea |
+|---|---|
+| `matmul_global` | Each thread computes one `C[i][j]`, reading its row of A and column of B directly from global memory. |
+| `matmul_shared` | Each block loads `TILE x TILE` tiles of A and B into shared memory, synchronizes, accumulates, and moves to the next tile. |
 
----
+The program checks correctness (vs a CPU reference for N <= 512, otherwise global vs shared), times both kernels with CUDA events, and writes `results.csv`.
 
-## 🧠 Concept
-A **Distributed Lock** ensures:
-- Only one client holds the lock
-- Other clients are denied access
-- Prevents race conditions
+## Build and run
 
-This concept is widely used in systems like:
-- Google Chubby
-- Bigtable
-- Distributed Databases
+```bash
+make                 # needs nvcc; ARCH=native by default (e.g. make ARCH=sm_75)
+./matmul             # sizes 256 512 1024 2048
+./matmul 4096 8192   # custom sizes
+make TILE=32         # try a different tile size
+```
 
----
+## Why shared memory helps
 
-## ⚙️ Technologies Used
-- Java
-- Apache ZooKeeper
+- **Global kernel:** every output element does `2N` global loads. Neighbouring threads re-read the same rows/columns, so total global traffic is about `2N^3` floats. The kernel is memory-bound.
+- **Tiled kernel:** each element of A and B is loaded from global memory once per tile and reused `TILE` times from shared memory. Global traffic drops by a factor of about `TILE` (about `2N^3 / TILE`), and arithmetic intensity rises accordingly.
+- **Access patterns:** in both kernels, loads from global memory are coalesced across `threadIdx.x`. In the tiled kernel, `Bs[k][tx]` is conflict-free and `As[ty][k]` is a broadcast, so no padding is needed.
+- **Cost:** two `__syncthreads()` per tile and shared-memory usage of `2 * TILE^2 * 4` bytes per block (2 KB at TILE=16).
 
----
+## Expected behaviour
 
-## 🧪 Implementation 1: ZooKeeper Lock
+- Small N (<= 256): little difference, since launch overhead and the L2 cache dominate.
+- Larger N: the tiled kernel is typically several times faster, and the gap grows with N.
+- Larger TILE (32) reduces global traffic further, but uses more shared memory and registers per block and can lower occupancy.
+- Neither kernel approaches cuBLAS. Register tiling, vectorized loads and tensor cores are the next steps.
 
-### Steps:
-1. Start ZooKeeper server
-2. Open ZooKeeper CLI
-3. Run:
+## Results
 
-create /lock "client1"
-create /lock "client2"
+Run `./matmul` on your GPU and paste the table here (results depend on the GPU):
 
+| GPU | N | Global (ms) | Shared (ms) | Speedup |
+|---|---|---|---|---|
+| _fill in_ | | | | |
 
-### Output:
-- First command → Lock acquired
-- Second command → `Node already exists`
+## Possible extensions
 
----
-
-## 📸 ZooKeeper Demo
-
-![ZooKeeper Demo](zookeeper-demo.png)
-
----
-
-## 💻 Implementation 2: Java Lock
-
-### Code Logic:
-- Create a file `lockfile.txt`
-- If file is created → Lock acquired
-- If file exists → Lock denied
-
-### Run:
-
-javac DistributedLock.java
-java DistributedLock
-
-
-### Output:
-- Terminal 1 → Lock acquired
-- Terminal 2 → Lock already acquired
-
----
-
-## 🔄 Comparison
-
-| Feature | ZooKeeper | Java Implementation |
-|--------|----------|--------------------|
-| Type | Distributed | Local |
-| Lock Mechanism | Znode (/lock) | File (lockfile.txt) |
-| Fault Tolerance | Yes | No |
-| Real-world Usage | Yes | Simulation |
-
----
-
-## 🎯 Conclusion
-- ZooKeeper provides **reliable distributed locking**
-- Java implementation simulates the same concept locally
-- Both ensure **mutual exclusion**
-
-## 📁 Project Structure
-
-
-DS/
-├── DistributedLock.java
-├── README.md
-├── zookeeper-demo.png
-
-
-## 👨‍💻 Author
-Ajinkya Wadhale
+- Compare against cuBLAS `cublasSgemm`.
+- Add 2x2 register blocking per thread.
+- Profile with Nsight Compute (global load transactions, shared-memory bank conflicts, occupancy).
+- Sweep TILE in {8, 16, 32}.
